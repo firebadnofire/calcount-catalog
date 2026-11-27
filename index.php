@@ -2,7 +2,17 @@
 declare(strict_types=1);
 
 $directory = __DIR__;
-$files = glob($directory . DIRECTORY_SEPARATOR . '*.json') ?: [];
+$files = [];
+
+foreach (['*.json', '*.ccnl', '*.ccr'] as $pattern) {
+    $matches = glob($directory . DIRECTORY_SEPARATOR . $pattern);
+
+    if ($matches !== false) {
+        $files = array_merge($files, $matches);
+    }
+}
+
+$files = array_values(array_unique($files));
 
 function escape(string $value): string
 {
@@ -115,6 +125,8 @@ function readJsonMetadata(string $path, string $filename): array
         'valid' => true,
         'readable' => true,
         'usedFilenameFallback' => true,
+        'format' => null,
+        'qrSupported' => true,
     ];
 
     $size = filesize($path);
@@ -194,8 +206,10 @@ function readJsonMetadata(string $path, string $filename): array
     if ($rawType !== null) {
         $normalizedType = strtolower($rawType);
 
-        if (in_array($normalizedType, ['solid', 'liquid'], true)) {
-            $metadata['type'] = ucfirst($normalizedType);
+        if (in_array($normalizedType, ['solid', 'food'], true)) {
+            $metadata['type'] = 'Solid';
+        } elseif (in_array($normalizedType, ['liquid'], true)) {
+            $metadata['type'] = 'Liquid';
         }
     }
 
@@ -255,13 +269,401 @@ function readJsonMetadata(string $path, string $filename): array
     return $metadata;
 }
 
+/**
+ * Detect the file format from magic bytes + extension.
+ *
+ * Returns one of: 'ccnl', 'ccr', 'json', or 'unknown'.
+ *
+ * A binary file with the zstd magic prefix is treated as a CCR bundle
+ * even if the extension is unusual, since the zstd magic is unique.
+ */
+function detectFormat(string $path): string
+{
+    $handle = fopen($path, 'rb');
+
+    if ($handle === false) {
+        return 'unknown';
+    }
+
+    $magic = fread($handle, 4);
+    fclose($handle);
+
+    if ($magic === "\x28\xB5\x2F\xFD") {
+        return 'ccr';
+    }
+
+    $extension = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+
+    if ($extension === 'ccnl') {
+        return 'ccnl';
+    }
+
+    if ($extension === 'json' || $extension === 'ccr') {
+        return $extension === 'ccr' ? 'ccr' : 'json';
+    }
+
+    return 'unknown';
+}
+
+/**
+ * Parse a USTAR archive into an associative array of member paths -> byte
+ * strings.
+ *
+ * Only the fields required to walk the member layout are inspected; the
+ * parser is intentionally permissive and tolerates GNU/pax extensions in a
+ * minimal way (it does not handle multi-block pax records, which CalCount
+ * does not emit).
+ */
+function parseUstar(string $bytes): array
+{
+    $members = [];
+    $offset = 0;
+    $length = strlen($bytes);
+
+    while ($offset + 512 <= $length) {
+        $header = substr($bytes, $offset, 512);
+
+        $nameField = substr($header, 0, 100);
+        $name = trim(substr($nameField, 0, strpos($nameField, "\0") ?: 100), " \0");
+
+        // Empty name + empty size = end of archive sentinel.
+        if ($name === '') {
+            break;
+        }
+
+        $sizeRaw = trim(substr($header, 124, 12), " \0");
+        $size = octdec($sizeRaw) ?: 0;
+
+        // USTAR name layout: prefix (155) + '/' + name (100).
+        $prefixRaw = substr($header, 345, 155);
+        $prefix = trim($prefixRaw, " \0");
+
+        if ($prefix !== '') {
+            $name = $prefix . '/' . $name;
+        }
+
+        $dataStart = $offset + 512;
+        $data = $size > 0 ? substr($bytes, $dataStart, $size) : '';
+
+        $members[$name] = $data;
+
+        // Data blocks are padded up to a multiple of 512.
+        $paddedSize = (int) ceil($size / 512) * 512;
+        $offset = $dataStart + $paddedSize;
+    }
+
+    return $members;
+}
+
+/**
+ * Convert a CCR ingredient amount into "number of label servings".
+ *
+ * Ingredient units are normalised to a base unit (grams or millilitres) and
+ * then divided by the label's per-serving weight or volume, matching the
+ * dimensional basis. If the label declares no compatible serving size, the
+ * raw quantity is treated as a serving count as a best-effort fallback.
+ */
+function ccrIngredientServings(array $ingredient, array $food): float
+{
+    $quantity = numericValue($ingredient['quantity'] ?? null);
+
+    if ($quantity === null) {
+        return 1.0;
+    }
+
+    $unit = strtolower(
+        stringValue($ingredient['unit'] ?? 'servings') ?? 'servings'
+    );
+
+    if ($unit === 'servings') {
+        return $quantity;
+    }
+
+    $toGrams = match ($unit) {
+        'g' => 1.0,
+        'oz' => 28.349523125,
+        default => null,
+    };
+
+    $toMilliliters = match ($unit) {
+        'ml' => 1.0,
+        'l' => 1000.0,
+        'fl_oz' => 29.5735295625,
+        default => null,
+    };
+
+    $servingWeight = numericValue(
+        $food['servingWeightGrams']
+        ?? $food['serving_weight_grams']
+        ?? null
+    );
+
+    $servingVolume = numericValue(
+        $food['servingVolumeMilliliters']
+        ?? $food['serving_volume_milliliters']
+        ?? null
+    );
+
+    if ($toGrams !== null && $servingWeight !== null && $servingWeight > 0) {
+        return $quantity * $toGrams / $servingWeight;
+    }
+
+    if (
+        $toMilliliters !== null
+        && $servingVolume !== null
+        && $servingVolume > 0
+    ) {
+        return $quantity * $toMilliliters / $servingVolume;
+    }
+
+    return $quantity;
+}
+
+/**
+ * Read CCR metadata from a zstd-compressed USTAR bundle on disk.
+ *
+ * The bundle is decompressed to a temporary file with the `zstd` CLI (PHP
+ * has no zstd extension here) and the USTAR members are parsed in pure PHP.
+ *
+ * Returns a metadata array shaped identically to `readJsonMetadata()`, plus
+ * a `format` key set to 'ccr'.
+ */
+function readCcrMetadata(string $path, string $filename): array
+{
+    $metadata = [
+        'name' => humanizeFilename($filename),
+        'brand' => null,
+        'description' => 'CalCount recipe data',
+        'serving' => null,
+        'type' => null,
+        'barcode' => null,
+        'calories' => null,
+        'carbs' => null,
+        'protein' => null,
+        'fat' => null,
+        'valid' => true,
+        'readable' => true,
+        'usedFilenameFallback' => true,
+        'format' => 'ccr',
+        'qrSupported' => true,
+    ];
+
+    $size = filesize($path);
+
+    if ($size === false || $size > 2 * 1024 * 1024) {
+        $metadata['description'] = 'Metadata preview unavailable';
+        $metadata['readable'] = false;
+
+        return $metadata;
+    }
+
+    $zstdBinary = null;
+
+    foreach ([
+        'C:\Users\william\AppData\Local\Microsoft\WinGet\Links\zstd.exe',
+        'zstd',
+    ] as $candidate) {
+        if (is_string($candidate) && (
+            $candidate === 'zstd'
+            || (is_string($candidate) && @is_file($candidate))
+        )) {
+            $zstdBinary = $candidate;
+
+            break;
+        }
+    }
+
+    if ($zstdBinary === null) {
+        $metadata['description'] = 'The zstd CLI is not available on this host';
+        $metadata['readable'] = false;
+
+        return $metadata;
+    }
+
+    $tempTar = sys_get_temp_dir()
+        . DIRECTORY_SEPARATOR
+        . 'ccr_'
+        . bin2hex(random_bytes(8))
+        . '.tar';
+
+    $command =
+        escapeshellarg($zstdBinary)
+        . ' -d '
+        . escapeshellarg($path)
+        . ' -o '
+        . escapeshellarg($tempTar);
+
+    exec($command, $outputLines, $exitCode);
+
+    if ($exitCode !== 0 || !is_file($tempTar)) {
+        @unlink($tempTar);
+
+        $metadata['description'] = 'Could not decompress this CCR bundle';
+        $metadata['valid'] = false;
+        $metadata['readable'] = false;
+
+        return $metadata;
+    }
+
+    $tarBytes = file_get_contents($tempTar);
+    @unlink($tempTar);
+
+    if ($tarBytes === false) {
+        $metadata['description'] = 'Could not read the CCR archive contents';
+        $metadata['valid'] = false;
+        $metadata['readable'] = false;
+
+        return $metadata;
+    }
+
+    $members = parseUstar($tarBytes);
+
+    if (!isset($members['manifest.json'])) {
+        $metadata['description'] = 'The CCR bundle is missing manifest.json';
+        $metadata['valid'] = false;
+
+        return $metadata;
+    }
+
+    try {
+        $manifest = json_decode($members['manifest.json'], true, 512, JSON_THROW_ON_ERROR);
+    } catch (JsonException) {
+        $metadata['description'] = 'The CCR manifest is not valid JSON';
+        $metadata['valid'] = false;
+
+        return $metadata;
+    }
+
+    if (!is_array($manifest)) {
+        $metadata['description'] = 'The CCR manifest is malformed';
+        $metadata['valid'] = false;
+
+        return $metadata;
+    }
+
+    $jsonName = stringValue($manifest['name'] ?? null);
+
+    if ($jsonName !== null) {
+        $metadata['name'] = $jsonName;
+        $metadata['usedFilenameFallback'] = false;
+    }
+
+    $explicitDescription = stringValue($manifest['description'] ?? null);
+
+    if ($explicitDescription !== null) {
+        $metadata['description'] = $explicitDescription;
+    }
+
+    $servings = numericValue($manifest['servings'] ?? null);
+
+    if ($servings !== null && $servings > 0) {
+        $metadata['serving'] = (int) $servings === $servings
+            ? ((int) $servings) . ' serving' . ($servings === 1 ? '' : 's')
+            : $servings . ' servings';
+    }
+
+    $nutrition = [
+        'calories' => 0,
+        'carbs' => 0,
+        'protein' => 0,
+        'fat' => 0,
+    ];
+
+    $hasNutrition = false;
+
+    foreach ((array) ($manifest['ingredients'] ?? []) as $ingredient) {
+        if (!is_array($ingredient)) {
+            continue;
+        }
+
+        $labelId = stringValue($ingredient['label_id'] ?? null);
+
+        if ($labelId === null) {
+            continue;
+        }
+
+        $labelPath = 'labels/' . $labelId . '.ccnl';
+
+        if (!isset($members[$labelPath])) {
+            continue;
+        }
+
+        try {
+            $label = json_decode($members[$labelPath], true, 512, JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            continue;
+        }
+
+        if (!is_array($label)) {
+            continue;
+        }
+
+        $food = isset($label['food']) && is_array($label['food'])
+            ? $label['food']
+            : $label;
+
+        $perServing = $food['nutritionPerServing']
+            ?? $food['nutrition_per_serving']
+            ?? null;
+
+        if (!is_array($perServing)) {
+            continue;
+        }
+
+        $quantity = ccrIngredientServings($ingredient, $food);
+
+        $calories = numericValue($perServing['calories'] ?? null);
+        $carbs = numericValue($perServing['carbsGrams'] ?? $perServing['carbs_grams'] ?? null);
+        $protein = numericValue($perServing['proteinGrams'] ?? $perServing['protein_grams'] ?? null);
+        $fat = numericValue($perServing['fatGrams'] ?? $perServing['fat_grams'] ?? null);
+
+        if ($calories !== null) {
+            $nutrition['calories'] += $calories * $quantity;
+            $hasNutrition = true;
+        }
+
+        if ($carbs !== null) {
+            $nutrition['carbs'] += $carbs * $quantity;
+            $hasNutrition = true;
+        }
+
+        if ($protein !== null) {
+            $nutrition['protein'] += $protein * $quantity;
+            $hasNutrition = true;
+        }
+
+        if ($fat !== null) {
+            $nutrition['fat'] += $fat * $quantity;
+            $hasNutrition = true;
+        }
+    }
+
+    if ($hasNutrition) {
+        $totalServings = ($servings !== null && $servings > 0) ? $servings : 1.0;
+
+        $metadata['calories'] = $nutrition['calories'] / $totalServings;
+        $metadata['carbs'] = $nutrition['carbs'] / $totalServings;
+        $metadata['protein'] = $nutrition['protein'] / $totalServings;
+        $metadata['fat'] = $nutrition['fat'] / $totalServings;
+    }
+
+    return $metadata;
+}
+
 $items = [];
 
 foreach ($files as $path) {
     $filename = basename($path);
     $size = filesize($path);
     $modified = filemtime($path);
-    $metadata = readJsonMetadata($path, $filename);
+    $detectedFormat = detectFormat($path);
+
+    if ($detectedFormat === 'ccr') {
+        $metadata = readCcrMetadata($path, $filename);
+    } else {
+        $metadata = readJsonMetadata($path, $filename);
+        $metadata['format'] = $detectedFormat === 'ccnl' ? 'ccnl' : 'json';
+    }
 
     $searchParts = [
         $metadata['name'],
@@ -293,6 +695,8 @@ foreach ($files as $path) {
         'valid' => $metadata['valid'],
         'readable' => $metadata['readable'],
         'usedFilenameFallback' => $metadata['usedFilenameFallback'],
+        'format' => $metadata['format'],
+        'qrSupported' => $metadata['qrSupported'] ?? true,
         'size' => $size === false ? 0 : $size,
         'modified' => $modified === false ? 0 : $modified,
         'url' => './' . rawurlencode($filename),
@@ -827,6 +1231,13 @@ $latestModified = empty($items)
             font-weight: 750;
         }
 
+        .badge.format {
+            border-color: var(--accent);
+            background: var(--accent-soft);
+            color: var(--accent);
+            letter-spacing: 0.03em;
+        }
+
         .badge.valid {
             border-color: transparent;
             background: var(--success-soft);
@@ -1048,6 +1459,52 @@ $latestModified = empty($items)
             cursor: pointer;
         }
 
+        .qr-controls {
+            display: grid;
+            gap: 0.75rem;
+            margin-top: 1rem;
+            grid-template-columns: auto 1fr;
+            align-items: center;
+        }
+
+        .qr-control {
+            display: grid;
+            gap: 0.35rem;
+        }
+
+        .qr-control-label {
+            color: var(--muted);
+            font-size: 0.8rem;
+        }
+
+        .qr-select {
+            height: 2.4rem;
+            min-width: 8rem;
+            padding: 0 0.7rem;
+            border: 1px solid var(--border);
+            border-radius: 0.6rem;
+            background: var(--surface);
+            color: var(--text);
+            font: inherit;
+        }
+
+        .qr-progress {
+            width: 100%;
+            height: 0.5rem;
+            overflow: hidden;
+            border-radius: 999px;
+            background: var(--accent-soft);
+        }
+
+        .qr-progress-fill {
+            display: block;
+            width: 0%;
+            height: 100%;
+            border-radius: inherit;
+            background: var(--accent);
+            transition: width 120ms linear;
+        }
+
         .empty-state {
             padding: 4rem 1.5rem;
             border: 1px dashed var(--border);
@@ -1253,8 +1710,10 @@ $latestModified = empty($items)
                 <h1>CalCount Catalog</h1>
 
                 <p class="intro">
-                    Download ready-to-import JSON files for common foods and
-                    drinks, with serving and nutrition data already filled in.
+                    Download ready-to-import CalCount files for common foods
+                    and recipes. Serves CalCount's modern <code>.ccnl</code>
+                    and <code>.ccr</code> formats plus legacy <code>.json</code>
+                    exports, with serving and nutrition data filled in.
                 </p>
             </div>
 
@@ -1499,6 +1958,14 @@ $latestModified = empty($items)
                                     ) ?>
                                 </span>
 
+                                <?php if ($item['format'] !== null): ?>
+                                    <span class="badge format">
+                                        <?= escape(
+                                            strtoupper($item['format'])
+                                        ) ?>
+                                    </span>
+                                <?php endif; ?>
+
                                 <?php if ($item['type'] !== null): ?>
                                     <span class="badge">
                                         <?= escape($item['type']) ?>
@@ -1513,11 +1980,15 @@ $latestModified = empty($items)
 
                                 <?php if ($item['valid']): ?>
                                     <span class="badge valid">
-                                        Valid JSON
+                                        <?= $item['format'] === 'ccr'
+                                            ? 'Valid CCR'
+                                            : 'Valid JSON' ?>
                                     </span>
                                 <?php else: ?>
                                     <span class="badge invalid">
-                                        Invalid JSON
+                                        <?= $item['format'] === 'ccr'
+                                            ? 'Invalid CCR'
+                                            : 'Invalid JSON' ?>
                                     </span>
                                 <?php endif; ?>
 
@@ -1549,27 +2020,34 @@ $latestModified = empty($items)
 
                             <?php if ($item['valid']): ?>
                                 <div class="file-actions">
-                                    <button
-                                        class="button secondary qr-button"
-                                        type="button"
-                                        data-url="<?= escape($item['url']) ?>"
-                                        data-name="<?= escape($item['name']) ?>"
-                                    >
-                                        <svg
-                                            aria-hidden="true"
-                                            viewBox="0 0 24 24"
-                                            fill="none"
+                                    <?php if ($item['qrSupported']): ?>
+                                        <button
+                                            class="button secondary qr-button"
+                                            type="button"
+                                            data-url="<?= escape($item['url']) ?>"
+                                            data-name="<?= escape($item['name']) ?>"
+                                            data-format="<?= (
+                                                $item['format'] === 'ccr'
+                                                    ? 'ccr'
+                                                    : 'ccnl'
+                                            ) ?>"
                                         >
-                                            <path
-                                                d="M4 4h6v6H4V4Zm10 0h6v6h-6V4ZM4 14h6v6H4v-6Zm11 0h2v2h-2v-2Zm3 0h2v4h-2v-4Zm-4 4h2v2h-2v-2Zm4 2h2v-2"
-                                                stroke="currentColor"
-                                                stroke-width="2"
-                                                stroke-linejoin="round"
-                                            />
-                                        </svg>
+                                            <svg
+                                                aria-hidden="true"
+                                                viewBox="0 0 24 24"
+                                                fill="none"
+                                            >
+                                                <path
+                                                    d="M4 4h6v6H4V4Zm10 0h6v6h-6V4ZM4 14h6v6H4v-6Zm11 0h2v2h-2v-2Zm3 0h2v4h-2v-4Zm-4 4h2v2h-2v-2Zm4 2h2v-2"
+                                                    stroke="currentColor"
+                                                    stroke-width="2"
+                                                    stroke-linejoin="round"
+                                                />
+                                            </svg>
 
-                                        QR
-                                    </button>
+                                            QR
+                                        </button>
+                                    <?php endif; ?>
 
                                     <a
                                         class="button"
@@ -1618,8 +2096,8 @@ $latestModified = empty($items)
                 <h2>No food files are available yet</h2>
 
                 <p>
-                    Add one or more <code>.json</code> files beside
-                    <code>index.php</code>.
+                    Add one or more <code>.ccnl</code>, <code>.ccr</code>, or
+                    <code>.json</code> files beside <code>index.php</code>.
                 </p>
             </section>
         <?php endif; ?>
@@ -1700,9 +2178,9 @@ $latestModified = empty($items)
                 </header>
 
                 <div class="qr-dialog-body">
-                    <p class="qr-help">
-                        Scan this QR code from another device to import the
-                        exact JSON food file.
+                    <p class="qr-help" id="qr-help">
+                        Point a CalCount camera at this code to import the
+                        exact file.
                     </p>
 
                     <div class="qr-stage">
@@ -1710,12 +2188,52 @@ $latestModified = empty($items)
                             id="qr-output"
                             class="hidden"
                             role="img"
-                            aria-label="QR code containing the JSON food file"
+                            aria-label="QR code containing the CalCount file"
                         ></div>
 
                         <p id="qr-status" class="qr-status">
                             Preparing QR code…
                         </p>
+                    </div>
+
+                    <div
+                        id="qr-controls"
+                        class="qr-controls"
+                        role="group"
+                        aria-label="Broadcast controls"
+                    >
+                        <div class="qr-control">
+                            <label class="qr-control-label" for="qr-duration">
+                                Speed
+                            </label>
+
+                            <select id="qr-duration" class="qr-select">
+                                <option value="1000">1s / frame</option>
+                                <option value="750">750ms / frame</option>
+                                <option value="500">500ms / frame</option>
+                            </select>
+                        </div>
+
+                        <div class="qr-control">
+                            <span
+                                class="qr-control-label"
+                                id="qr-progress-label"
+                            >
+                                Frame 1 of 1
+                            </span>
+
+                            <div
+                                class="qr-progress"
+                                role="progressbar"
+                                aria-labelledby="qr-progress-label"
+                                aria-valuemin="0"
+                                aria-valuemax="1"
+                                aria-valuenow="0"
+                                id="qr-progress"
+                            >
+                                <span class="qr-progress-fill"></span>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -1725,7 +2243,7 @@ $latestModified = empty($items)
                         class="button"
                         type="button"
                     >
-                        OK
+                        End
                     </button>
                 </footer>
             </div>
@@ -1842,27 +2360,512 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
             const qrClose = document.getElementById('qr-close');
             const qrCloseIcon =
                 document.getElementById('qr-close-icon');
+            const qrDuration = document.getElementById('qr-duration');
+            const qrProgress = document.getElementById('qr-progress');
+            const qrProgressFill =
+                qrProgress.querySelector('.qr-progress-fill');
+            const qrProgressLabel =
+                document.getElementById('qr-progress-label');
+            const qrHelp = document.getElementById('qr-help');
 
-            function closeQrDialog() {
-                qrDialog.close();
+            const CCQR_CHUNK_BYTES = 384;
+            const CCQR_MAX_FRAMES = 128;
+            const CCQR_QUIET_ZONE = 4;
+            const CCQR_RENDER_SIZE = 640;
+            const CCQR_HEX_CHARS = '0123456789abcdef';
+
+            const CCQR_CRC_TABLE = (() => {
+                const table = new Uint32Array(256);
+
+                for (let n = 0; n < 256; n++) {
+                    let c = n;
+
+                    for (let k = 0; k < 8; k++) {
+                        c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+                    }
+
+                    table[n] = c >>> 0;
+                }
+
+                return table;
+            })();
+
+            function ccqrCrc32(text) {
+                let c = 0xffffffff;
+
+                for (let i = 0; i < text.length; i++) {
+                    c = CCQR_CRC_TABLE[(c ^ text.charCodeAt(i)) & 0xff]
+                        ^ (c >>> 8);
+                }
+
+                return (c ^ 0xffffffff) >>> 0;
+            }
+
+            function ccqrBase64Url(bytes) {
+                let binary = '';
+                const step = 0x8000;
+
+                for (let i = 0; i < bytes.length; i += step) {
+                    binary += String.fromCharCode.apply(
+                        null,
+                        bytes.subarray(i, i + step)
+                    );
+                }
+
+                return btoa(binary)
+                    .replace(/\+/g, '-')
+                    .replace(/\//g, '_')
+                    .replace(/=+$/, '');
+            }
+
+            function ccqrHex(bytes) {
+                let out = '';
+
+                for (let i = 0; i < bytes.length; i++) {
+                    const value = bytes[i];
+
+                    out += CCQR_HEX_CHARS[(value >>> 4) & 0xf]
+                        + CCQR_HEX_CHARS[value & 0xf];
+                }
+
+                return out;
+            }
+
+            async function ccqrSha256(bytes) {
+                if (
+                    typeof crypto !== 'undefined'
+                    && crypto.subtle
+                    && typeof crypto.subtle.digest === 'function'
+                ) {
+                    return ccqrHex(
+                        new Uint8Array(
+                            await crypto.subtle.digest(
+                                'SHA-256',
+                                bytes
+                            )
+                        )
+                    );
+                }
+
+                /* Pure JS fallback for non-secure contexts. */
+                const K = [
+                    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+                    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+                    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+                    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+                    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+                    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+                    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+                    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+                    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+                    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+                    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+                    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+                    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+                    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+                    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+                    0x90befff5, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+                ];
+
+                const lengthBits = bytes.length * 8;
+                const padded = new Uint8Array(
+                    ((bytes.length + 9) & ~63) | 64
+                );
+                const view = new DataView(padded.buffer);
+
+                padded.set(bytes);
+                padded[bytes.length] = 0x80;
+                view.setUint32(
+                    padded.length - 8,
+                    Math.floor(lengthBits / 0x100000000),
+                    false
+                );
+                view.setUint32(
+                    padded.length - 4,
+                    lengthBits >>> 0,
+                    false
+                );
+
+                let h0 = 0x6a09e667;
+                let h1 = 0xbb67ae85;
+                let h2 = 0x3c6ef372;
+                let h3 = 0xa54ff53a;
+                let h4 = 0x510e527f;
+                let h5 = 0x9b05688c;
+                let h6 = 0x1f83d9ab;
+                let h7 = 0x5be0cd19;
+
+                const w = new Uint32Array(64);
+
+                for (let block = 0; block < padded.length; block += 64) {
+                    for (let t = 0; t < 16; t++) {
+                        w[t] = view.getUint32(block + t * 4, false);
+                    }
+
+                    for (let t = 16; t < 64; t++) {
+                        const s0 = (w[t - 15] >>> 7)
+                            ^ (w[t - 15] >>> 18)
+                            ^ (w[t - 15] << 15);
+                        const s1 = (w[t - 2] >>> 17)
+                            ^ (w[t - 2] >>> 19)
+                            ^ (w[t - 2] << 13);
+
+                        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+                    }
+
+                    let a = h0;
+                    let b = h1;
+                    let c = h2;
+                    let d = h3;
+                    let e = h4;
+                    let f = h5;
+                    let g = h6;
+                    let h = h7;
+
+                    for (let t = 0; t < 64; t++) {
+                        const S1 = (e >>> 6)
+                            ^ (e >>> 11)
+                            ^ (e >>> 25);
+                        const ch = (e & f) ^ (~e & g);
+                        const temp1 = (h + S1 + ch + K[t] + w[t]) >>> 0;
+                        const S0 = (a >>> 2)
+                            ^ (a >>> 13)
+                            ^ (a >>> 22);
+                        const maj = (a & b) ^ (a & c) ^ (b & c);
+                        const temp2 = (S0 + maj) >>> 0;
+
+                        h = g;
+                        g = f;
+                        f = e;
+                        e = (d + temp1) >>> 0;
+                        d = c;
+                        c = b;
+                        b = a;
+                        a = (temp1 + temp2) >>> 0;
+                    }
+
+                    h0 = (h0 + a) >>> 0;
+                    h1 = (h1 + b) >>> 0;
+                    h2 = (h2 + c) >>> 0;
+                    h3 = (h3 + d) >>> 0;
+                    h4 = (h4 + e) >>> 0;
+                    h5 = (h5 + f) >>> 0;
+                    h6 = (h6 + g) >>> 0;
+                    h7 = (h7 + h) >>> 0;
+                }
+
+                const digest = new Uint8Array(32);
+                const digestView = new DataView(digest.buffer);
+
+                digestView.setUint32(0, h0, false);
+                digestView.setUint32(4, h1, false);
+                digestView.setUint32(8, h2, false);
+                digestView.setUint32(12, h3, false);
+                digestView.setUint32(16, h4, false);
+                digestView.setUint32(20, h5, false);
+                digestView.setUint32(24, h6, false);
+                digestView.setUint32(28, h7, false);
+
+                return ccqrHex(digest);
+            }
+
+            function ccqrSessionUuid() {
+                if (
+                    typeof crypto !== 'undefined'
+                    && typeof crypto.randomUUID === 'function'
+                ) {
+                    return crypto.randomUUID();
+                }
+
+                const random = new Uint8Array(16);
+                crypto.getRandomValues(random);
+                random[6] = (random[6] & 0x0f) | 0x40;
+                random[8] = (random[8] & 0x3f) | 0x80;
+
+                const hex = ccqrHex(random);
+
+                return (
+                    hex.slice(0, 8)
+                    + '-' + hex.slice(8, 12)
+                    + '-' + hex.slice(12, 16)
+                    + '-' + hex.slice(16, 20)
+                    + '-' + hex.slice(20, 32)
+                );
+            }
+
+            async function ccqrBuildPackets(bytes, packetType) {
+                if (
+                    bytes.length === 0
+                    || bytes.length > CCQR_CHUNK_BYTES * CCQR_MAX_FRAMES
+                ) {
+                    throw new Error(
+                        'This file is outside the 48 KiB carousel limit.'
+                    );
+                }
+
+                const session = ccqrSessionUuid();
+                const sha = await ccqrSha256(bytes);
+                const packets = [];
+                let offset = 0;
+
+                while (offset < bytes.length) {
+                    const chunk = bytes.subarray(
+                        offset,
+                        Math.min(offset + CCQR_CHUNK_BYTES, bytes.length)
+                    );
+                    const index = packets.length;
+                    const data = ccqrBase64Url(chunk);
+                    const head = [
+                        'CCQR1',
+                        session,
+                        packetType,
+                        String(index),
+                        String(Math.ceil(bytes.length / CCQR_CHUNK_BYTES)),
+                        sha
+                    ].join(':');
+
+                    const crc = ccqrCrc32(head + ':' + data);
+
+                    packets.push(
+                        head
+                        + ':'
+                        + crc.toString(16).padStart(8, '0')
+                        + ':'
+                        + data
+                    );
+
+                    offset += CCQR_CHUNK_BYTES;
+                }
+
+                return packets;
+            }
+
+            function ccqrDraw(canvas, packet) {
+                /*
+                 * Build the QR model on a detached container so the library's
+                 * drawing side effects (its own canvas + <img> swap) never
+                 * touch the canvas we return. We then repaint the raw module
+                 * matrix ourselves, sized to the full code with the quiet zone.
+                 */
+                const holder = document.createElement('div');
+                const qr = new QRCode(holder, {
+                    text: packet,
+                    correctLevel: QRCode.CorrectLevel.M
+                });
+
+                const matrix = qr._oQRCode;
+                const modules = matrix.getModuleCount();
+                const total = modules + 2 * CCQR_QUIET_ZONE;
+                const side = Math.max(
+                    64,
+                    Math.floor(CCQR_RENDER_SIZE / total) * total
+                );
+                const pixel = side / total;
+
+                canvas.width = side;
+                canvas.height = side;
+
+                const ctx = canvas.getContext('2d');
+
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, side, side);
+                ctx.fillStyle = '#000000';
+
+                for (let y = 0; y < modules; y++) {
+                    for (let x = 0; x < modules; x++) {
+                        if (matrix.isDark(x, y)) {
+                            ctx.fillRect(
+                                (x + CCQR_QUIET_ZONE) * pixel,
+                                (y + CCQR_QUIET_ZONE) * pixel,
+                                pixel,
+                                pixel
+                            );
+                        }
+                    }
+                }
+            }
+
+            const ccqrState = {
+                running: false,
+                request: 0,
+                packets: null,
+                index: 0,
+                loop: 1,
+                lastTick: 0
+            };
+
+            function ccqrStop() {
+                ccqrState.running = false;
+                ccqrState.request++;
             }
 
             function setQrStatus(message, isError = false) {
-                qrOutput.replaceChildren();
+                if (!ccqrState.running) {
+                    qrOutput.replaceChildren();
+                }
+
                 qrOutput.classList.add('hidden');
                 qrStatus.classList.remove('hidden');
                 qrStatus.classList.toggle('error', isError);
                 qrStatus.textContent = message;
             }
 
+            async function startCarousel(url, name, packetType) {
+                const response = await fetch(url, {
+                    cache: 'no-store',
+                    credentials: 'same-origin'
+                });
+
+                if (!response.ok) {
+                    throw new Error(
+                        `Could not load the file (HTTP ${response.status}).`
+                    );
+                }
+
+                const bytes = new Uint8Array(await response.arrayBuffer());
+                const packets = await ccqrBuildPackets(bytes, packetType);
+                const request = ++ccqrState.request;
+
+                if (request !== ccqrState.request) {
+                    return;
+                }
+
+                ccqrState.packets = packets;
+                ccqrState.index = 0;
+                ccqrState.loop = 1;
+                ccqrState.lastTick = 0;
+                ccqrState.running = true;
+
+                qrProgress.setAttribute(
+                    'aria-valuemax',
+                    String(packets.length)
+                );
+                qrHelp.textContent =
+                    `Broadcasting in a loop (${packets.length} `
+                    + `${packets.length === 1
+                        ? 'frame'
+                        : 'frames'} per cycle). `
+                    + 'Keep this dialog open until CalCount has imported '
+                    + 'the file, then press End.';
+
+                function updateProgress() {
+                    qrProgressLabel.textContent =
+                        `Frame ${ccqrState.index + 1} of `
+                        + `${ccqrState.packets.length}`;
+                    qrProgress.setAttribute(
+                        'aria-valuenow',
+                        String(ccqrState.index + 1)
+                    );
+                    qrProgressFill.style.width =
+                        ((ccqrState.index + 1)
+                            / ccqrState.packets.length
+                            * 100).toFixed(2) + '%';
+                }
+
+                function drawCurrentFrame() {
+                    if (!ccqrState.running) {
+                        return;
+                    }
+
+                    setQrStatus('');
+                    qrStatus.classList.add('hidden');
+                    qrOutput.replaceChildren();
+
+                    const canvas = document.createElement('canvas');
+                    ccqrDraw(canvas, ccqrState.packets[ccqrState.index]);
+                    qrOutput.appendChild(canvas);
+                    qrOutput.classList.remove('hidden');
+                    updateProgress();
+                }
+
+                drawCurrentFrame();
+
+                function tick(now) {
+                    if (!ccqrState.running) {
+                        return;
+                    }
+
+                    const duration =
+                        Number(qrDuration.value) || 1000;
+
+                    if (ccqrState.lastTick !== 0) {
+                        const elapsed = now - ccqrState.lastTick;
+
+                        if (elapsed < duration) {
+                            requestAnimationFrame(tick);
+
+                            return;
+                        }
+
+                        ccqrState.lastTick += duration * Math.floor(
+                            elapsed / duration
+                        );
+                    } else {
+                        ccqrState.lastTick = now;
+                    }
+
+                    ccqrState.index++;
+
+                    if (ccqrState.index >= ccqrState.packets.length) {
+                        ccqrState.index = 0;
+                        ccqrState.loop++;
+                    }
+
+                    drawCurrentFrame();
+                    requestAnimationFrame(tick);
+                }
+
+                requestAnimationFrame(tick);
+            }
+
+            function closeQrDialog() {
+                ccqrStop();
+                qrDialog.close();
+            }
+
             async function openQrDialog(button) {
                 const url = button.dataset.url;
                 const name = button.dataset.name ?? 'Food export';
+                const format = button.dataset.format;
 
+                ccqrStop();
                 qrFoodName.textContent = name;
-                setQrStatus('Preparing QR code…');
+
+                if (!ccqrState.running) {
+                    setQrStatus('Preparing QR code…');
+                }
 
                 qrDialog.showModal();
+
+                /*
+                 * Legacy bare-JSON files keep the original single QR code.
+                 * CCNL and CCR files broadcast as a CCQR1 carousel because
+                 * they are binary or grow beyond single-code capacity.
+                 */
+                const useCarousel = format === 'ccnl' || format === 'ccr';
+
+                if (useCarousel) {
+                    try {
+                        if (typeof QRCode !== 'function') {
+                            throw new Error(
+                                'The embedded QR encoder could not be '
+                                + 'loaded.'
+                            );
+                        }
+
+                        await startCarousel(url, name, format);
+                    } catch (error) {
+                        ccqrStop();
+                        const message =
+                            error instanceof Error
+                                ? error.message
+                                : 'Could not start the broadcast.';
+
+                        setQrStatus(message, true);
+                    }
+
+                    return;
+                }
 
                 try {
                     if (typeof QRCode !== 'function') {
